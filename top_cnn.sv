@@ -36,6 +36,35 @@ module top_cnn#(parameter cr1 = 16, cc1 = 8, kr1 = 9, kc1 = 8, rr1 = 26, rc1 = 2
     // resynthesizing while you calibrate.
     input [4:0] relu1_shift,
     input [4:0] relu2_shift,
+    // --- Per-channel rescale multipliers (x256 fixed-point) -----------
+    // NEW: weights are now quantized PER OUTPUT CHANNEL (see
+    // quantize_int8.py's quantize_tensor_int8_per_channel), which means
+    // each channel's raw accumulator lands at a DIFFERENT implicit scale.
+    // relu1_shift/relu2_shift (above) and the fixed >>>8 at DONE are each
+    // a single SHARED value per layer, so before that shared shift/bias
+    // stage runs, every channel needs to be pulled back onto one common
+    // reference scale first: rescaled[c] = (raw[c] * rescale[c]) >>> 8.
+    // See top_cnn.sv's conv1_result_snapshot_rescaled/
+    // conv2_accumulator_rescaled below, and the WRITE_FC/DONE rewrite,
+    // for where these actually get applied. conv1_rescale/conv2_rescale
+    // stay 16-wide (matching the existing bias ports) even though conv1
+    // only has 8 real channels -- entries 8:15 are unused/harmless, same
+    // padding convention as everywhere else in this design.
+    input signed [15:0] conv1_rescale [0:15],
+    input signed [15:0] conv2_rescale [0:15],
+    input signed [15:0] fc_rescale [0:fcc1-1],
+    // fc_shift: the FC layer's final output shift, calibrated the SAME
+    // way as relu1_shift/relu2_shift -- NOT hardcoded to >>>8 anymore.
+    // Reason: per-channel weight quantization lets fc.weight use its
+    // full int8 range regardless of its TRUE float magnitude (scale is
+    // always 127/max_abs). If training (e.g. QAT) drifts that true
+    // magnitude smaller, the post-rescale accumulator legitimately gets
+    // smaller too -- a fixed shift then has no way to compensate and
+    // crushes the output toward zero (confirmed: this collapsed a QAT
+    // run's final_scores to ~{-2,-1,0,1} across the board). conv1_shift/
+    // conv2_shift already self-correct for exactly this every epoch;
+    // fc_shift now does too.
+    input [4:0] fc_shift,
     // --- fc_weights: banked BRAM interface (16 banks x 400 words) ------
     output reg [8:0] fc_weights_addr,
     input signed [7:0] fc_weights_rdata [0:15],  // int8 weights
@@ -105,6 +134,26 @@ reg signed [7:0] a_tile [0:7][0:15];  // int8 activations/pixels. Row dim (r1) s
 reg signed [31:0] conv1_result_snapshot [0:7][0:15];
 reg signed [31:0] conv2_accumulator [0:7][0:15];  // spatial-row dim shrunk 16->8 to match the systolic array's new r1
 reg signed [31:0] fc_accumulator [0:15];
+
+// --- Per-channel rescale: bring conv1_result_snapshot/conv2_accumulator
+// off their (now channel-dependent) per-channel weight scale and onto
+// the shared reference scale relu.sv's bias-add + shift_amount expect --
+// see conv1_rescale/conv2_rescale port comments above. Computed
+// combinationally (always@(*) below) straight off the existing
+// snapshot/accumulator registers, so rel1/rel2 simply read these instead
+// of the raw ones -- relu.sv itself needs ZERO changes.
+reg signed [31:0] conv1_result_snapshot_rescaled [0:7][0:15];
+reg signed [31:0] conv2_accumulator_rescaled [0:7][0:15];
+// 48-bit intermediate: 32-bit signed accumulator * 16-bit signed rescale
+// can reach 48 bits before the >>>8 that undoes the x256 fixed point.
+reg signed [47:0] rescale_temp1 [0:7][0:15];
+reg signed [47:0] rescale_temp2 [0:7][0:15];
+// Scratch register for FC's per-class rescale at DONE (below) -- reused
+// each loop iteration via blocking assignment before the same
+// iteration's nonblocking final_scores write, standard procedural
+// scratch-variable pattern (safe: fully consumed before being
+// overwritten by the next iteration).
+reg signed [47:0] fc_rescale_temp;
 reg start_pool1;
 reg start_pool2;
 reg start_compute;
@@ -136,8 +185,13 @@ localparam WRITE_FC      = 16;
 localparam DONE          = 17;
 localparam PREP_POOL2    = 18;
 localparam PREP_POOL1    = 19;
+localparam WRITE_FC_SCALE = 20;
 
 integer i,j,k,row,col,index,feature,ch,kr,kc,fc_k,fc_i,fc_j;
+// Dedicated loop variables for the combinational rescale block below --
+// kept separate from i/j (used by the clocked FSM block) so no tool ever
+// has reason to flag two procedural blocks driving the same variable.
+integer ri, rj;
 
 // Shared serialization counter -- reused sequentially across
 // LOAD_TILE1/WRITE_TILE1/PREP_POOL1/LOAD_TILE2/WRITE_TILE2/PREP_POOL2/
@@ -194,8 +248,27 @@ systolic_array#(.r1(8), .c1(16), .r2(16), .c2(16)) conv (
 // right and zero out rows 1-15. conv2's path never had this problem
 // since relu_results2 is already sourced from conv2_accumulator, a
 // real captured register -- this makes conv1's path the same shape.
+// Combinational per-channel rescale: (raw * rescale[channel]) >>> 8.
+// Channel index is the SECOND array dimension (j) for both
+// conv1_result_snapshot and conv2_accumulator -- matches conv1_bias/
+// conv2_bias/conv1_rescale/conv2_rescale all being indexed [0:15] by
+// output channel. Pure combinational (always@(*)), so this settles
+// within the same cycle conv1_result_snapshot/conv2_accumulator update --
+// rel1/rel2 below read the settled rescaled value on the very next edge,
+// same timing shape as before.
+always @(*) begin
+    for (ri = 0; ri < 8; ri = ri + 1) begin
+        for (rj = 0; rj < 16; rj = rj + 1) begin
+            rescale_temp1[ri][rj] = conv1_result_snapshot[ri][rj] * conv1_rescale[rj];
+            conv1_result_snapshot_rescaled[ri][rj] = rescale_temp1[ri][rj] >>> 8;
+            rescale_temp2[ri][rj] = conv2_accumulator[ri][rj] * conv2_rescale[rj];
+            conv2_accumulator_rescaled[ri][rj] = rescale_temp2[ri][rj] >>> 8;
+        end
+    end
+end
+
 relu#(.r1(8), .c1(16)) rel1 (
-    .results(conv1_result_snapshot),
+    .results(conv1_result_snapshot_rescaled),
     .relu_results(relu_results1),
     .conv_bias(current_conv_bias),
     .shift_amount(relu1_shift)
@@ -208,7 +281,7 @@ relu#(.r1(8), .c1(16)) rel1 (
 // they both write into the same full-width conv2_accumulator before
 // relu2 ever sees it -- see WAIT_COMPUTE2 below.
 relu#(.r1(8), .c1(16)) rel2 (
-    .results(conv2_accumulator),
+    .results(conv2_accumulator_rescaled),
     .relu_results(relu_results2),
     .conv_bias(current_conv_bias),
     .shift_amount(relu2_shift)
@@ -761,10 +834,11 @@ always@(posedge clk) begin
                 // fc_accumulator's tile-24 update (above) hasn't landed
                 // yet on THIS edge (nonblocking assignment) -- computing
                 // final_scores here would read the pre-tile-24 value,
-                // silently dropping the last tile's contribution. DONE
-                // (entered next cycle) computes final_scores instead,
-                // by which point fc_accumulator is fully correct.
-                state<= DONE;
+                // silently dropping the last tile's contribution.
+                // WRITE_FC_SCALE (entered next cycle) computes
+                // final_scores instead, by which point fc_accumulator is
+                // fully correct.
+                state<= WRITE_FC_SCALE;
             end
             else begin
                 tile_count <= tile_count + 1;
@@ -772,10 +846,30 @@ always@(posedge clk) begin
                 end
         end
 
+        WRITE_FC_SCALE : begin
+            // Serialized, ONE class per cycle -- reuses a SINGLE
+            // rescale-multiply + fc_shift barrel-shifter instance across
+            // all 10 classes, instead of the 10 parallel copies an
+            // unrolled `for` loop in one cycle would synthesize. This
+            // design is already close to its LUT ceiling, and a
+            // variable-amount shifter (needed now that fc_shift is a
+            // calibrated runtime value, not a fixed >>>8 -- see fc_shift
+            // port comment) is real hardware cost per instance, unlike a
+            // fixed shift which is free wiring. 10 extra cycles once, at
+            // the very end of inference, is free by comparison.
+            fc_rescale_temp = (fc_accumulator[scnt] * fc_rescale[scnt]) >>> 8;
+            final_scores[scnt] <= (fc_rescale_temp + fc_bias[scnt]) >>> fc_shift;
+            if (scnt == 9) begin
+                scnt <= 0;
+                state <= DONE;
+            end
+            else begin
+                scnt <= scnt + 1;
+            end
+        end
+
         DONE: begin
-            for(j=0;j<10;j=j+1)
-            final_scores[j] <= (fc_accumulator[j] + fc_bias[j]) >>> 8;
-            done_cnn <=1;
+            done_cnn <= 1;
         end
         endcase
 end

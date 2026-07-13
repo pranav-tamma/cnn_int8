@@ -65,6 +65,20 @@ module top_cnn_tb;
     reg [4:0] relu1_shift = 8;
     reg [4:0] relu2_shift = 10;
 
+    // --- per-channel rescale multipliers (x256 fixed-point) -- NEW for
+    // per-channel weight quantization. Loaded via `include, same pattern
+    // as conv1_bias/conv2_bias/fc_bias below, from
+    // quantize_int8.py's newly-generated conv1_rescale.vh/
+    // conv2_rescale.vh/fc_rescale.vh.
+    reg signed [15:0] conv1_rescale [0:15];
+    reg signed [15:0] conv2_rescale [0:15];
+    reg signed [15:0] fc_rescale [0:9];
+    // fc_shift: the FC layer's final output shift, now calibrated (see
+    // top_cnn.sv's fc_shift port comment) instead of a hardcoded >>>8.
+    // Update this to match whatever quantize_int8.py prints, same
+    // manual-update convention as relu1_shift/relu2_shift above.
+    reg [4:0] fc_shift = 6;
+
     wire signed [31:0] final_scores [0:9];
 
     integer i, j;
@@ -96,6 +110,12 @@ module top_cnn_tb;
         `include "C:/Users/prana/cnn_project/generated/conv1_bias.vh"
         `include "C:/Users/prana/cnn_project/generated/conv2_bias.vh"
         `include "C:/Users/prana/cnn_project/generated/fc_bias.vh"
+        // NEW: per-channel rescale multipliers -- same .vh-include
+        // pattern as the biases above, generated alongside them by
+        // quantize_int8.py.
+        `include "C:/Users/prana/cnn_project/generated/conv1_rescale.vh"
+        `include "C:/Users/prana/cnn_project/generated/conv2_rescale.vh"
+        `include "C:/Users/prana/cnn_project/generated/fc_rescale.vh"
     end
 
     // --- behavioral 1-cycle-latency BRAM read, one always block per bank
@@ -140,6 +160,10 @@ module top_cnn_tb;
         .conv2_bias(conv2_bias),
         .relu1_shift(relu1_shift),
         .relu2_shift(relu2_shift),
+        .conv1_rescale(conv1_rescale),
+        .conv2_rescale(conv2_rescale),
+        .fc_rescale(fc_rescale),
+        .fc_shift(fc_shift),
         .fc_weights_addr(fc_weights_addr),
         .fc_weights_rdata(fc_weights_rdata),
         .fc_bias(fc_bias),
