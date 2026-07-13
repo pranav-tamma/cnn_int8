@@ -144,10 +144,14 @@ reg signed [31:0] fc_accumulator [0:15];
 // of the raw ones -- relu.sv itself needs ZERO changes.
 reg signed [31:0] conv1_result_snapshot_rescaled [0:7][0:15];
 reg signed [31:0] conv2_accumulator_rescaled [0:7][0:15];
-// 48-bit intermediate: 32-bit signed accumulator * 16-bit signed rescale
-// can reach 48 bits before the >>>8 that undoes the x256 fixed point.
-reg signed [47:0] rescale_temp1 [0:7][0:15];
-reg signed [47:0] rescale_temp2 [0:7][0:15];
+// Scalar scratch registers for the SERIALIZED rescale (RESCALE_CONV1/
+// RESCALE_CONV2 states below) -- one shared multiplier reused across all
+// 128 elements per layer, not 128 parallel ones. Same reuse-a-scratch-
+// register pattern as fc_rescale_temp below (blocking assign, consumed
+// same cycle by a nonblocking register write, safe since fully consumed
+// before the next iteration overwrites it).
+reg signed [47:0] rescale_temp1;
+reg signed [47:0] rescale_temp2;
 // Scratch register for FC's per-class rescale at DONE (below) -- reused
 // each loop iteration via blocking assignment before the same
 // iteration's nonblocking final_scores write, standard procedural
@@ -186,6 +190,8 @@ localparam DONE          = 17;
 localparam PREP_POOL2    = 18;
 localparam PREP_POOL1    = 19;
 localparam WRITE_FC_SCALE = 20;
+localparam RESCALE_CONV1 = 21;
+localparam RESCALE_CONV2 = 22;
 
 integer i,j,k,row,col,index,feature,ch,kr,kc,fc_k,fc_i,fc_j;
 // Dedicated loop variables for the combinational rescale block below --
@@ -198,7 +204,9 @@ integer ri, rj;
 // LOAD_FC. None of these states are ever active at the same time, so a
 // single counter is safe to reuse rather than needing a separate one
 // per state.
-reg [4:0] scnt;
+reg [6:0] scnt;  // widened from [4:0] (max 31) to [6:0] (max 127) -- RESCALE_CONV1/
+                 // RESCALE_CONV2 need to count 0..127; every other existing use
+                 // (max value 17, e.g. LOAD_FC) still fits fine in the wider register.
 // jcnt: sub-counter used by LOAD_TILE2 and LOAD_FC to serialize their
 // reads of pool1_result/pool2_result down to ONE element per cycle.
 // Those reads previously pulled 16 different (channel,row,col) addresses
@@ -246,26 +254,21 @@ systolic_array#(.r1(8), .c1(16), .r2(16), .c2(16)) conv (
 // low). WRITE_TILE1 now takes 16 cycles to write row_buf1 one row at a
 // time; reading the live wire across all 16 would only get row 0
 // right and zero out rows 1-15. conv2's path never had this problem
-// since relu_results2 is already sourced from conv2_accumulator, a
-// real captured register -- this makes conv1's path the same shape.
-// Combinational per-channel rescale: (raw * rescale[channel]) >>> 8.
-// Channel index is the SECOND array dimension (j) for both
-// conv1_result_snapshot and conv2_accumulator -- matches conv1_bias/
-// conv2_bias/conv1_rescale/conv2_rescale all being indexed [0:15] by
-// output channel. Pure combinational (always@(*)), so this settles
-// within the same cycle conv1_result_snapshot/conv2_accumulator update --
-// rel1/rel2 below read the settled rescaled value on the very next edge,
-// same timing shape as before.
-always @(*) begin
-    for (ri = 0; ri < 8; ri = ri + 1) begin
-        for (rj = 0; rj < 16; rj = rj + 1) begin
-            rescale_temp1[ri][rj] = conv1_result_snapshot[ri][rj] * conv1_rescale[rj];
-            conv1_result_snapshot_rescaled[ri][rj] = rescale_temp1[ri][rj] >>> 8;
-            rescale_temp2[ri][rj] = conv2_accumulator[ri][rj] * conv2_rescale[rj];
-            conv2_accumulator_rescaled[ri][rj] = rescale_temp2[ri][rj] >>> 8;
-        end
-    end
-end
+// Per-channel rescale is now SERIALIZED (see RESCALE_CONV1/RESCALE_CONV2
+// states below), NOT this combinational block -- a real resource bug,
+// not a design choice: computing all 8x16=128 elements combinationally,
+// for BOTH conv1 and conv2, meant 256 simultaneous 32x16-bit multiplies
+// every cycle. That blew the DSP budget (128 already used by the
+// systolic array's PEs) and spilled the rest into LUT-based multipliers,
+// pushing utilization to 140,953 LUTs (265% of the 53,200 available) and
+// 2704 Bonded IOB (13x the 200 available) -- confirmed by direct
+// synthesis report, not a hypothesis. RESCALE_CONV1/RESCALE_CONV2 reuse
+// ONE shared multiplier per layer instead (128 cycles each, same
+// serialize-for-LUTs pattern already used throughout this design, e.g.
+// WRITE_FC_SCALE for the FC output stage) -- 10,880 extra cycles per
+// full conv1 pass (85 tiles x 128) is negligible next to this design's
+// existing cycle counts, and is the correct trade given how tight this
+// project's LUT budget already was even before this bug.
 
 relu#(.r1(8), .c1(16)) rel1 (
     .results(conv1_result_snapshot_rescaled),
@@ -438,10 +441,31 @@ always@(posedge clk) begin
             for(index=0;index<128;index=index+1) begin
                 conv1_result_snapshot[index/16][index%16] <= results[index/16][index%16];
             end
-            state<= WRITE_TILE1;
+            state<= RESCALE_CONV1;
         end
         else
         state<=WAIT_COMPUTE1;
+        end
+
+        RESCALE_CONV1 : begin
+            // Serialized, ONE (row,channel) element per cycle -- reuses a
+            // SINGLE rescale-multiply instance across all 128 elements
+            // instead of the 128 parallel copies the old always@(*)
+            // block synthesized (see rescale_temp1's comment above for
+            // why that was a real, confirmed resource bug). scnt is free
+            // to reuse here -- WRITE_TILE1 (entered next) resets it to 0
+            // itself before using it for its own row-write counting.
+            ri = scnt / 16;
+            rj = scnt % 16;
+            rescale_temp1 = conv1_result_snapshot[ri][rj] * conv1_rescale[rj];
+            conv1_result_snapshot_rescaled[ri][rj] <= rescale_temp1 >>> 8;
+            if (scnt == 127) begin
+                scnt <= 0;
+                state <= WRITE_TILE1;
+            end
+            else begin
+                scnt <= scnt + 1;
+            end
         end
 
         WRITE_TILE1 : begin
@@ -637,7 +661,7 @@ always@(posedge clk) begin
                     // conv2_accumulator now has all 16 real channels for
                     // this spatial tile after just one pass through the
                     // 5 k_tiles -- no second channel-half pass needed.
-                    state <= WRITE_TILE2;
+                    state <= RESCALE_CONV2;
                     end
                     else begin
                         k_tile <= k_tile + 1;
@@ -646,6 +670,25 @@ always@(posedge clk) begin
             end
             else
             state<=WAIT_COMPUTE2;
+        end
+
+        RESCALE_CONV2 : begin
+            // Same serialization as RESCALE_CONV1 above, one shared
+            // multiplier reused across all 128 elements instead of 128
+            // parallel copies. scnt is free here -- WRITE_TILE2 (entered
+            // next) resets it to 0 itself before using it for its own
+            // row-write counting.
+            ri = scnt / 16;
+            rj = scnt % 16;
+            rescale_temp2 = conv2_accumulator[ri][rj] * conv2_rescale[rj];
+            conv2_accumulator_rescaled[ri][rj] <= rescale_temp2 >>> 8;
+            if (scnt == 127) begin
+                scnt <= 0;
+                state <= WRITE_TILE2;
+            end
+            else begin
+                scnt <= scnt + 1;
+            end
         end
 
         WRITE_TILE2 : begin
