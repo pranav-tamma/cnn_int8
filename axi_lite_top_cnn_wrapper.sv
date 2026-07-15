@@ -28,7 +28,13 @@
 //                        write 0 to release and start inference -- same
 //                        rst/start convention tb_cnn.sv already uses)
 //   0x004  STATUS       bit0 = done_cnn (read-only; writes ignored)
-//   0x008  SHIFTS       [4:0]=relu1_shift, [9:5]=relu2_shift, [14:10]=fc_shift
+//   0x008  SHIFTS       [4:0]=fc_shift (relu1_shift/relu2_shift REMOVED --
+//                        top_cnn.sv's relu instances now use compile-time
+//                        RELU1_SHIFT/RELU2_SHIFT localparams, not runtime
+//                        ports; this was a deliberate LUT-savings fix,
+//                        see relu.sv's own comment for why. Recalibrating
+//                        those two now means editing top_cnn.sv directly
+//                        and resynthesizing, not writing this register.)
 //   0x00C  (reserved)
 //   0x010-0x04C  CONV1_BIAS[0:15]      (16 words)
 //   0x050-0x08C  CONV2_BIAS[0:15]      (16 words)
@@ -155,12 +161,10 @@ module axi_lite_top_cnn_wrapper #(
         .kernel_matrix2_rdata(kernel_matrix2_rdata),
         .conv1_bias(conv1_bias),
         .conv2_bias(conv2_bias),
-        .relu1_shift(regs[IDX_SHIFTS][4:0]),
-        .relu2_shift(regs[IDX_SHIFTS][9:5]),
         .conv1_rescale(conv1_rescale),
         .conv2_rescale(conv2_rescale),
         .fc_rescale(fc_rescale),
-        .fc_shift(regs[IDX_SHIFTS][14:10]),
+        .fc_shift(regs[IDX_SHIFTS][4:0]),
         .fc_weights_addr(fc_weights_addr),
         .fc_weights_rdata(fc_weights_rdata),
         .fc_bias(fc_bias),
@@ -206,55 +210,100 @@ module axi_lite_top_cnn_wrapper #(
 
     always @(posedge s_axi_aclk) begin
         if (!s_axi_aresetn) begin
-            // NOTE: this loop must NOT touch regs[IDX_STATUS] or
+            // NOTE: this must NOT touch regs[IDX_STATUS] or
             // regs[IDX_FINAL_SCORES0 .. +9] -- those each have their OWN
             // dedicated always block below (mirroring done_cnn/
-            // final_scores_w), which ALSO drives them on reset. Looping
-            // over ALL of NREGS here used to include those indices too,
-            // creating the exact same multi-driven-net bug as the
-            // earlier s_axi_rdata fix -- just a second, separate instance
-            // of it I didn't catch the first time (confirmed directly in
-            // the synthesis log: "multi-driven net ... regs_reg[1][30]/Q
-            // ... axi_lite_top_cnn_wrapper.sv:112" -- regs[1] is
-            // IDX_STATUS). Skipping those indices here leaves each
-            // register with exactly one driver again.
-            for (ri = 0; ri < NREGS; ri = ri + 1) begin
-                if (ri != IDX_STATUS && !(ri >= IDX_FINAL_SCORES0 && ri < IDX_FINAL_SCORES0 + 10))
-                    regs[ri] <= 32'd0;
-            end
+            // final_scores_w), which ALSO drives them on reset. An
+            // earlier version of this loop ran ri across the FULL
+            // 0..NREGS-1 range with an `if` guard skipping those specific
+            // indices -- that guard is always false for ri==IDX_STATUS or
+            // ri in the FINAL_SCORES range, so the assignment inside it
+            // can never actually execute there, but synthesis still
+            // inferred a driver at those indices anyway (confirmed
+            // directly via DRC: "Multiple Driver Nets ... regs_reg[88][0]
+            // ... GEN_FINAL_SCORES_MIRROR[0].regs_reg[88][0]" -- a reset
+            // tree merging multiple registers under the same `if
+            // (!aresetn)` branch doesn't always respect per-index dead-
+            // code elimination the way plain simulation does, even when
+            // the guard condition is provably always-false for that
+            // index). Splitting the LOOP BOUNDS themselves instead -- so
+            // ri can never structurally reach those indices at all --
+            // removes the driver at the source rather than relying on
+            // the tool to prove a branch dead.
+            regs[IDX_CONTROL] <= 32'd0;
+            // regs[IDX_STATUS] (index 1) intentionally skipped here --
+            // owned entirely by its own dedicated block below.
+            for (ri = IDX_STATUS + 1; ri < IDX_FINAL_SCORES0; ri = ri + 1)
+                regs[ri] <= 32'd0;
+            // regs[IDX_FINAL_SCORES0 .. +9] (88..97) intentionally
+            // skipped here -- owned entirely by their own dedicated
+            // blocks below.
         end else if (write_en) begin
             // STATUS (index 1) and FINAL_SCORES (88..97) are read-only --
             // silently ignore writes there rather than erroring, standard
             // AXI-Lite convention for read-only registers.
+            //
+            // CHANGED: collapsed from 4 separate byte-strobed writes
+            // (`if (wstrb[n]) regs[idx][byte n] <= ...`) down to one
+            // unconditional 32-bit write. Every one of these ~94
+            // registers (bias/rescale arrays) is only ever written ONCE
+            // at startup by software loading weights -- never touched
+            // again during actual inference -- so byte-level write
+            // granularity was never doing anything useful here. It WAS,
+            // however, costing real control-set variety: 4 differently-
+            // gated write paths per register instead of 1, contributing
+            // to the [Place 30-487] slice-packing failure (too many
+            // distinct control sets for the device to pack efficiently,
+            // even though raw LUT/FF counts fit). Software loading a
+            // register now must write all 4 bytes with WSTRB fully
+            // asserted (0xF) -- true of every AXI-Lite master that
+            // writes full 32-bit words anyway, so no real workflow cost.
             if (waddr_idx != IDX_STATUS &&
                 !(waddr_idx >= IDX_FINAL_SCORES0 && waddr_idx < IDX_FINAL_SCORES0 + 10) &&
                 waddr_idx < NREGS) begin
-                if (s_axi_wstrb[0]) regs[waddr_idx][7:0]   <= s_axi_wdata[7:0];
-                if (s_axi_wstrb[1]) regs[waddr_idx][15:8]  <= s_axi_wdata[15:8];
-                if (s_axi_wstrb[2]) regs[waddr_idx][23:16] <= s_axi_wdata[23:16];
-                if (s_axi_wstrb[3]) regs[waddr_idx][31:24] <= s_axi_wdata[31:24];
+                regs[waddr_idx] <= s_axi_wdata;
             end
         end
     end
 
     // STATUS register: bit0 mirrors done_cnn continuously (hardware-driven,
     // independent of the AXI write channel above).
+    //
+    // CHANGED: this used to write regs[IDX_STATUS] (a slot inside the
+    // shared regs[] array), even though no other block ever touched that
+    // same index -- but synthesis still produced a multi-driven-net
+    // error there (confirmed via DRC AND the synthesis log, both
+    // pointing at this exact register, even after restructuring the
+    // reset loop's BOUNDS to make it structurally impossible to reach
+    // index 1). That strongly suggests Vivado's array inference doesn't
+    // cleanly handle one shared array being written by multiple
+    // different always blocks, even when each block owns a disjoint set
+    // of indices with zero logical overlap. Rather than patch this a
+    // third time inside the shared array, STATUS now gets its own
+    // completely standalone register -- never touched by ANY other
+    // always block, so there is no shared array for the tool to get
+    // confused about. See the read-mux below for how index 1 now
+    // resolves to THIS register instead of regs[1].
+    reg [31:0] status_reg;
     always @(posedge s_axi_aclk) begin
         if (!s_axi_aresetn)
-            regs[IDX_STATUS] <= 32'd0;
+            status_reg <= 32'd0;
         else
-            regs[IDX_STATUS][0] <= done_cnn_w;
+            status_reg[0] <= done_cnn_w;
     end
 
     // FINAL_SCORES registers: mirror top_cnn's final_scores continuously,
-    // same hardware-driven pattern as STATUS above.
+    // same hardware-driven pattern as STATUS above -- and the SAME fix:
+    // a standalone array, never touched by any other always block,
+    // instead of slots inside the shared regs[] array.
+    reg [31:0] final_scores_reg [0:9];
     generate
         for (gi = 0; gi < 10; gi = gi + 1) begin : GEN_FINAL_SCORES_MIRROR
             always @(posedge s_axi_aclk) begin
                 if (!s_axi_aresetn)
-                    regs[IDX_FINAL_SCORES0 + gi] <= 32'd0;
+                    final_scores_reg[gi] <= 32'd0;
                 else
-                    regs[IDX_FINAL_SCORES0 + gi] <= final_scores_w[gi];
+                    final_scores_reg[gi] <= final_scores_w[gi];
             end
         end
     endgenerate
@@ -317,7 +366,19 @@ module axi_lite_top_cnn_wrapper #(
     end
 
     always @(*) begin
-        s_axi_rdata = (raddr_idx_reg < NREGS) ? regs[raddr_idx_reg] : 32'd0;
+        // STATUS and FINAL_SCORES now live in their own standalone
+        // registers (status_reg/final_scores_reg), not in regs[] --
+        // see those declarations above for why. regs[IDX_STATUS] and
+        // regs[IDX_FINAL_SCORES0..+9] are simply unused, dead slots in
+        // the array now (harmless -- nothing ever reads or writes them).
+        if (raddr_idx_reg == IDX_STATUS)
+            s_axi_rdata = status_reg;
+        else if (raddr_idx_reg >= IDX_FINAL_SCORES0 && raddr_idx_reg < IDX_FINAL_SCORES0 + 10)
+            s_axi_rdata = final_scores_reg[raddr_idx_reg - IDX_FINAL_SCORES0];
+        else if (raddr_idx_reg < NREGS)
+            s_axi_rdata = regs[raddr_idx_reg];
+        else
+            s_axi_rdata = 32'd0;
     end
 
 endmodule
