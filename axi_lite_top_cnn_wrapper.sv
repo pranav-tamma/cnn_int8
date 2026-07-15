@@ -69,7 +69,7 @@ module axi_lite_top_cnn_wrapper #(
     output reg                               s_axi_wready,
 
     // -- AXI4-Lite write response channel --
-    output reg  [1:0]                        s_axi_bresp,
+    output wire [1:0]                        s_axi_bresp,
     output reg                               s_axi_bvalid,
     input  wire                              s_axi_bready,
 
@@ -80,7 +80,7 @@ module axi_lite_top_cnn_wrapper #(
 
     // -- AXI4-Lite read data channel --
     output reg  [C_S_AXI_DATA_WIDTH-1:0]     s_axi_rdata,
-    output reg  [1:0]                        s_axi_rresp,
+    output wire [1:0]                        s_axi_rresp,
     output reg                               s_axi_rvalid,
     input  wire                              s_axi_rready,
 
@@ -112,10 +112,26 @@ module axi_lite_top_cnn_wrapper #(
     localparam IDX_FINAL_SCORES0 = 88;
 
     // ---- register file (drives top_cnn's config ports) -----------------
-    reg [31:0] regs [0:NREGS-1];
+    // CHANGED: CONTROL/SHIFTS/RESCALE no longer live inside a uniform
+    // 32-bit regs[] array. Each only ever used a handful of low bits
+    // (rst=1 bit, fc_shift=5 bits, each rescale word=16 bits) -- the
+    // remaining width was still a real flip-flop, reset and written on
+    // every access, contributing nothing functionally. Pulling them into
+    // their own narrow arrays removes 730 dead FF bits total:
+    //   CONTROL:   32->1  bit   (31 saved)
+    //   SHIFTS:    32->5  bits  (27 saved)
+    //   RESCALE:   32->16 bits x42 words (672 saved)
+    // BIAS stays a full 32-bit array -- top_cnn.sv's conv1_bias/
+    // conv2_bias/fc_bias ports are declared `signed [31:0]`, so
+    // narrowing those would require editing top_cnn.sv itself, which is
+    // out of scope here.
+    reg        control_reg;
+    reg  [4:0] shifts_reg;
+    reg [31:0] bias_regs    [0:41];   // CONV1_BIAS[0:15], CONV2_BIAS[0:15], FC_BIAS[0:9]
+    reg [15:0] rescale_regs [0:41];   // CONV1_RESC[0:15], CONV2_RESC[0:15], FC_RESC[0:9]
     integer ri;
 
-    wire cnn_rst    = regs[IDX_CONTROL][0];
+    wire cnn_rst    = control_reg;
     wire done_cnn_w;
 
     wire signed [31:0] conv1_bias      [0:15];
@@ -129,22 +145,22 @@ module axi_lite_top_cnn_wrapper #(
     genvar gi;
     generate
         for (gi = 0; gi < 16; gi = gi + 1) begin : GEN_CONV1_BIAS
-            assign conv1_bias[gi] = regs[IDX_CONV1_BIAS0 + gi];
+            assign conv1_bias[gi] = bias_regs[gi];
         end
         for (gi = 0; gi < 16; gi = gi + 1) begin : GEN_CONV2_BIAS
-            assign conv2_bias[gi] = regs[IDX_CONV2_BIAS0 + gi];
+            assign conv2_bias[gi] = bias_regs[16 + gi];
         end
         for (gi = 0; gi < 10; gi = gi + 1) begin : GEN_FC_BIAS
-            assign fc_bias[gi] = regs[IDX_FC_BIAS0 + gi];
+            assign fc_bias[gi] = bias_regs[32 + gi];
         end
         for (gi = 0; gi < 16; gi = gi + 1) begin : GEN_CONV1_RESC
-            assign conv1_rescale[gi] = regs[IDX_CONV1_RESC0 + gi][15:0];
+            assign conv1_rescale[gi] = rescale_regs[gi];
         end
         for (gi = 0; gi < 16; gi = gi + 1) begin : GEN_CONV2_RESC
-            assign conv2_rescale[gi] = regs[IDX_CONV2_RESC0 + gi][15:0];
+            assign conv2_rescale[gi] = rescale_regs[16 + gi];
         end
         for (gi = 0; gi < 10; gi = gi + 1) begin : GEN_FC_RESC
-            assign fc_rescale[gi] = regs[IDX_FC_RESC0 + gi][15:0];
+            assign fc_rescale[gi] = rescale_regs[32 + gi];
         end
     endgenerate
 
@@ -164,7 +180,7 @@ module axi_lite_top_cnn_wrapper #(
         .conv1_rescale(conv1_rescale),
         .conv2_rescale(conv2_rescale),
         .fc_rescale(fc_rescale),
-        .fc_shift(regs[IDX_SHIFTS][4:0]),
+        .fc_shift(shifts_reg),
         .fc_weights_addr(fc_weights_addr),
         .fc_weights_rdata(fc_weights_rdata),
         .fc_bias(fc_bias),
@@ -172,7 +188,12 @@ module axi_lite_top_cnn_wrapper #(
     );
 
     // ---- AXI4-Lite write channel (standard 2-phase handshake) -----------
-    reg [C_S_AXI_ADDR_WIDTH-1:0] awaddr_reg;
+    // CHANGED: awaddr_reg captures only the word index (addr[8:2]) now,
+    // not the full 9-bit address -- addr[1:0] are always 0 for this
+    // slave's 4-byte-aligned-only accesses (documented in the register
+    // map above), so those 2 bits were dead weight, same class of fix as
+    // the CONTROL/SHIFTS/RESCALE narrowing above.
+    reg [6:0] awaddr_reg;
     reg aw_en;
 
     always @(posedge s_axi_aclk) begin
@@ -183,7 +204,7 @@ module axi_lite_top_cnn_wrapper #(
         end else begin
             if (~s_axi_awready && s_axi_awvalid && s_axi_wvalid && aw_en) begin
                 s_axi_awready <= 1;
-                awaddr_reg <= s_axi_awaddr;
+                awaddr_reg <= s_axi_awaddr[8:2];
                 aw_en <= 0;
             end else if (s_axi_bready && s_axi_bvalid) begin
                 aw_en <= 1;
@@ -205,143 +226,90 @@ module axi_lite_top_cnn_wrapper #(
         end
     end
 
-    wire [6:0] waddr_idx = awaddr_reg[8:2];  // word index, 0..127 (98 used)
+    wire [6:0] waddr_idx = awaddr_reg;  // word index, 0..127 (98 used) -- awaddr_reg now stores this directly
     wire write_en = s_axi_wready && s_axi_wvalid && s_axi_awready && s_axi_awvalid;
 
     always @(posedge s_axi_aclk) begin
         if (!s_axi_aresetn) begin
-            // NOTE: this must NOT touch regs[IDX_STATUS] or
-            // regs[IDX_FINAL_SCORES0 .. +9] -- those each have their OWN
-            // dedicated always block below (mirroring done_cnn/
-            // final_scores_w), which ALSO drives them on reset. An
-            // earlier version of this loop ran ri across the FULL
-            // 0..NREGS-1 range with an `if` guard skipping those specific
-            // indices -- that guard is always false for ri==IDX_STATUS or
-            // ri in the FINAL_SCORES range, so the assignment inside it
-            // can never actually execute there, but synthesis still
-            // inferred a driver at those indices anyway (confirmed
-            // directly via DRC: "Multiple Driver Nets ... regs_reg[88][0]
-            // ... GEN_FINAL_SCORES_MIRROR[0].regs_reg[88][0]" -- a reset
-            // tree merging multiple registers under the same `if
-            // (!aresetn)` branch doesn't always respect per-index dead-
-            // code elimination the way plain simulation does, even when
-            // the guard condition is provably always-false for that
-            // index). Splitting the LOOP BOUNDS themselves instead -- so
-            // ri can never structurally reach those indices at all --
-            // removes the driver at the source rather than relying on
-            // the tool to prove a branch dead.
-            regs[IDX_CONTROL] <= 32'd0;
-            // regs[IDX_STATUS] (index 1) intentionally skipped here --
-            // owned entirely by its own dedicated block below.
-            for (ri = IDX_STATUS + 1; ri < IDX_FINAL_SCORES0; ri = ri + 1)
-                regs[ri] <= 32'd0;
-            // regs[IDX_FINAL_SCORES0 .. +9] (88..97) intentionally
-            // skipped here -- owned entirely by their own dedicated
-            // blocks below.
-        end else if (write_en) begin
+            // STATUS and FINAL_SCORES aren't reset here -- they no longer
+            // have wrapper-local storage at all (read directly from
+            // top_cnn's own done_cnn_w/final_scores_w, which top_cnn
+            // resets on its own rst input).
+            control_reg <= 1'd0;
+            shifts_reg  <= 5'd0;
+            for (ri = 0; ri < 42; ri = ri + 1) begin
+                bias_regs[ri]    <= 32'd0;
+                rescale_regs[ri] <= 16'd0;
+            end
+        end else if (write_en && waddr_idx < NREGS) begin
             // STATUS (index 1) and FINAL_SCORES (88..97) are read-only --
-            // silently ignore writes there rather than erroring, standard
-            // AXI-Lite convention for read-only registers.
+            // silently ignore writes there, standard AXI-Lite convention.
             //
-            // CHANGED: collapsed from 4 separate byte-strobed writes
-            // (`if (wstrb[n]) regs[idx][byte n] <= ...`) down to one
-            // unconditional 32-bit write. Every one of these ~94
-            // registers (bias/rescale arrays) is only ever written ONCE
-            // at startup by software loading weights -- never touched
-            // again during actual inference -- so byte-level write
-            // granularity was never doing anything useful here. It WAS,
-            // however, costing real control-set variety: 4 differently-
-            // gated write paths per register instead of 1, contributing
-            // to the [Place 30-487] slice-packing failure (too many
-            // distinct control sets for the device to pack efficiently,
-            // even though raw LUT/FF counts fit). Software loading a
-            // register now must write all 4 bytes with WSTRB fully
-            // asserted (0xF) -- true of every AXI-Lite master that
-            // writes full 32-bit words anyway, so no real workflow cost.
-            if (waddr_idx != IDX_STATUS &&
-                !(waddr_idx >= IDX_FINAL_SCORES0 && waddr_idx < IDX_FINAL_SCORES0 + 10) &&
-                waddr_idx < NREGS) begin
-                regs[waddr_idx] <= s_axi_wdata;
-            end
+            // Still ONE write_en condition gating everything below --
+            // the branches only choose which D-input the same enable
+            // feeds, they don't add new distinct enables, so this stays
+            // control-set-safe (the byte-strobe collapse from before is
+            // preserved: full-word writes only, no wstrb granularity).
+            if (waddr_idx == IDX_CONTROL)
+                control_reg <= s_axi_wdata[0];
+            else if (waddr_idx == IDX_SHIFTS)
+                shifts_reg <= s_axi_wdata[4:0];
+            else if (waddr_idx >= IDX_CONV1_BIAS0 && waddr_idx < IDX_CONV1_RESC0)
+                bias_regs[waddr_idx - IDX_CONV1_BIAS0] <= s_axi_wdata;
+            else if (waddr_idx >= IDX_CONV1_RESC0 && waddr_idx < IDX_FINAL_SCORES0)
+                rescale_regs[waddr_idx - IDX_CONV1_RESC0] <= s_axi_wdata[15:0];
         end
     end
 
-    // STATUS register: bit0 mirrors done_cnn continuously (hardware-driven,
-    // independent of the AXI write channel above).
-    //
-    // CHANGED: this used to write regs[IDX_STATUS] (a slot inside the
-    // shared regs[] array), even though no other block ever touched that
-    // same index -- but synthesis still produced a multi-driven-net
-    // error there (confirmed via DRC AND the synthesis log, both
-    // pointing at this exact register, even after restructuring the
-    // reset loop's BOUNDS to make it structurally impossible to reach
-    // index 1). That strongly suggests Vivado's array inference doesn't
-    // cleanly handle one shared array being written by multiple
-    // different always blocks, even when each block owns a disjoint set
-    // of indices with zero logical overlap. Rather than patch this a
-    // third time inside the shared array, STATUS now gets its own
-    // completely standalone register -- never touched by ANY other
-    // always block, so there is no shared array for the tool to get
-    // confused about. See the read-mux below for how index 1 now
-    // resolves to THIS register instead of regs[1].
-    reg [31:0] status_reg;
-    always @(posedge s_axi_aclk) begin
-        if (!s_axi_aresetn)
-            status_reg <= 32'd0;
-        else
-            status_reg[0] <= done_cnn_w;
-    end
+    // STATUS register: bit0 = done_cnn. top_cnn.sv declares done_cnn as
+    // `output reg`, driven inside its OWN clocked always block -- it's
+    // already a real flip-flop, same clock domain as this wrapper
+    // (s_axi_aclk feeds top_cnn.clk directly, no CDC). Re-registering it
+    // here (status_reg, previously 32 bits for 1 useful bit) was a pure
+    // duplicate: same value, one wire hop away, no correctness reason to
+    // buffer it again. Removed entirely -- the read mux below now reads
+    // done_cnn_w directly.
 
-    // FINAL_SCORES registers: mirror top_cnn's final_scores continuously,
-    // same hardware-driven pattern as STATUS above -- and the SAME fix:
-    // a standalone array, never touched by any other always block,
-    // instead of slots inside the shared regs[] array.
-    reg [31:0] final_scores_reg [0:9];
-    generate
-        for (gi = 0; gi < 10; gi = gi + 1) begin : GEN_FINAL_SCORES_MIRROR
-            always @(posedge s_axi_aclk) begin
-                if (!s_axi_aresetn)
-                    final_scores_reg[gi] <= 32'd0;
-                else
-                    final_scores_reg[gi] <= final_scores_w[gi];
-            end
-        end
-    endgenerate
+    // s_axi_bresp is never assigned anything but OKAY -- no error path
+    // exists on this slave -- so it's a constant, not a register.
+    assign s_axi_bresp = 2'b00;
 
     always @(posedge s_axi_aclk) begin
         if (!s_axi_aresetn) begin
             s_axi_bvalid <= 0;
-            s_axi_bresp  <= 2'b00;
         end else if (write_en && ~s_axi_bvalid) begin
             s_axi_bvalid <= 1;
-            s_axi_bresp  <= 2'b00;  // OKAY
         end else if (s_axi_bready && s_axi_bvalid) begin
             s_axi_bvalid <= 0;
         end
     end
 
     // ---- AXI4-Lite read channel (standard 2-phase handshake) ------------
-    reg [C_S_AXI_ADDR_WIDTH-1:0] araddr_reg;
+    // CHANGED: araddr_reg removed -- it was written on every read-address
+    // handshake but never read anywhere in this module. raddr_idx_reg
+    // (below) is the register the read mux actually uses; araddr_reg was
+    // pure dead weight (9 bits, no functional role).
     reg [6:0] raddr_idx_reg;
 
     always @(posedge s_axi_aclk) begin
         if (!s_axi_aresetn) begin
             s_axi_arready <= 0;
-            araddr_reg <= 0;
         end else begin
             if (~s_axi_arready && s_axi_arvalid) begin
                 s_axi_arready <= 1;
-                araddr_reg <= s_axi_araddr;
             end else begin
                 s_axi_arready <= 0;
             end
         end
     end
 
+    // s_axi_rresp is never assigned anything but OKAY -- no error path
+    // exists on this slave -- so it's a constant, not a register.
+    assign s_axi_rresp = 2'b00;
+
     always @(posedge s_axi_aclk) begin
         if (!s_axi_aresetn) begin
             s_axi_rvalid <= 0;
-            s_axi_rresp  <= 2'b00;
             // NOTE: s_axi_rdata is NOT reset here -- it's driven purely
             // combinationally below (always @(*)), which already settles
             // correctly on reset since raddr_idx_reg (its input) resets
@@ -359,24 +327,32 @@ module axi_lite_top_cnn_wrapper #(
         end else if (s_axi_arready && s_axi_arvalid && ~s_axi_rvalid) begin
             raddr_idx_reg <= s_axi_araddr[8:2];
             s_axi_rvalid <= 1;
-            s_axi_rresp  <= 2'b00;
         end else if (s_axi_rvalid && s_axi_rready) begin
             s_axi_rvalid <= 0;
         end
     end
 
     always @(*) begin
-        // STATUS and FINAL_SCORES now live in their own standalone
-        // registers (status_reg/final_scores_reg), not in regs[] --
-        // see those declarations above for why. regs[IDX_STATUS] and
-        // regs[IDX_FINAL_SCORES0..+9] are simply unused, dead slots in
-        // the array now (harmless -- nothing ever reads or writes them).
+        // STATUS and FINAL_SCORES read directly from top_cnn's own
+        // registered outputs (done_cnn_w/final_scores_w) -- no wrapper-
+        // local mirror needed, since top_cnn already registers both
+        // internally in the same clock domain as this module. CONTROL/
+        // SHIFTS/RESCALE live in their own narrow registers (control_reg/
+        // shifts_reg/rescale_regs) instead of a uniform 32-bit regs[]
+        // array -- zero-extended back to 32 bits here on readback,
+        // matching the register map's documented word layout exactly.
         if (raddr_idx_reg == IDX_STATUS)
-            s_axi_rdata = status_reg;
+            s_axi_rdata = {31'd0, done_cnn_w};
+        else if (raddr_idx_reg == IDX_CONTROL)
+            s_axi_rdata = {31'd0, control_reg};
+        else if (raddr_idx_reg == IDX_SHIFTS)
+            s_axi_rdata = {27'd0, shifts_reg};
+        else if (raddr_idx_reg >= IDX_CONV1_BIAS0 && raddr_idx_reg < IDX_CONV1_RESC0)
+            s_axi_rdata = bias_regs[raddr_idx_reg - IDX_CONV1_BIAS0];
+        else if (raddr_idx_reg >= IDX_CONV1_RESC0 && raddr_idx_reg < IDX_FINAL_SCORES0)
+            s_axi_rdata = {16'd0, rescale_regs[raddr_idx_reg - IDX_CONV1_RESC0]};
         else if (raddr_idx_reg >= IDX_FINAL_SCORES0 && raddr_idx_reg < IDX_FINAL_SCORES0 + 10)
-            s_axi_rdata = final_scores_reg[raddr_idx_reg - IDX_FINAL_SCORES0];
-        else if (raddr_idx_reg < NREGS)
-            s_axi_rdata = regs[raddr_idx_reg];
+            s_axi_rdata = final_scores_w[raddr_idx_reg - IDX_FINAL_SCORES0];
         else
             s_axi_rdata = 32'd0;
     end
