@@ -30,12 +30,18 @@ module top_cnn#(parameter cr1 = 16, cc1 = 8, kr1 = 9, kc1 = 8, rr1 = 26, rc1 = 2
     // (S_weight * S_activation), not the int8 output scale -- see relu.sv.
     input signed [31:0] conv1_bias [0:15],
     input signed [31:0] conv2_bias [0:15],
-    // Per-layer requantization shifts (see relu.sv) -- calibrated in
-    // Python from your chosen weight/activation quantization scales.
-    // Runtime ports, not localparams, so you can retune without
-    // resynthesizing while you calibrate.
-    input [4:0] relu1_shift,
-    input [4:0] relu2_shift,
+    // relu1_shift/relu2_shift REMOVED as runtime ports -- now compile-time
+    // localparams (RELU1_SHIFT/RELU2_SHIFT, defined below near the other
+    // localparams) passed directly to relu.sv's SHIFT_AMOUNT parameter.
+    // See relu.sv's own comment for why: a runtime-variable shift forced
+    // every one of its 256 total elements (across both rel1/rel2
+    // instances) to synthesize a real barrel shifter, which was very
+    // likely the single largest LUT cost in this design. Recalibrating
+    // these two values now means editing RELU1_SHIFT/RELU2_SHIFT below
+    // and resynthesizing -- not just updating a testbench/AXI register --
+    // but reflashing new weights already required resynthesis regardless,
+    // so this doesn't add a new kind of step, just moves where the value
+    // lives.
     // --- Per-channel rescale multipliers (x256 fixed-point) -----------
     // NEW: weights are now quantized PER OUTPUT CHANNEL (see
     // quantize_int8.py's quantize_tensor_int8_per_channel), which means
@@ -169,6 +175,17 @@ reg start_compute;
 // index directly and read pool1_result/pool2_result in place.
 
 reg[4:0] state;
+// ============================================================
+// RECALIBRATE THESE TWO VALUES whenever you re-run quantize_int8.py --
+// they replace what used to be tb_cnn.sv's runtime relu1_shift/
+// relu2_shift registers. Take the printed relu1_shift/relu2_shift values
+// directly from quantize_int8.py's output and put them here, then
+// resynthesize. (fc_shift is unaffected -- it's still a runtime port,
+// unchanged; only these two moved to compile-time.)
+localparam RELU1_SHIFT = 8;
+localparam RELU2_SHIFT = 10;
+// ============================================================
+
 localparam IDLE          = 0;
 localparam LOAD_TILE1     = 1;
 localparam START_COMPUTE1 = 2;
@@ -193,7 +210,7 @@ localparam WRITE_FC_SCALE = 20;
 localparam RESCALE_CONV1 = 21;
 localparam RESCALE_CONV2 = 22;
 
-integer i,j,k,row,col,index,feature,ch,kr,kc,fc_k,fc_i,fc_j;
+integer i,j,k,row,col,index,feature,fc_k,fc_i,fc_j;
 // Dedicated loop variables for the combinational rescale block below --
 // kept separate from i/j (used by the clocked FSM block) so no tool ever
 // has reason to flag two procedural blocks driving the same variable.
@@ -220,6 +237,23 @@ reg [6:0] scnt;  // widened from [4:0] (max 31) to [6:0] (max 127) -- RESCALE_CO
 reg [4:0] jcnt;
 reg a_matrix_req_valid;       // outstanding a_matrix BRAM read whose data lands THIS cycle?
 reg tile2_km_loaded;         // phase tracker for LOAD_TILE2 (see comment there)
+// pb_stage/pb_*_reg: LOAD_TILE2 Phase B's pipeline split. Phase B used
+// to compute index/row/col/feature/ch/kr/kc AND gather from
+// pool1_result AND write a_tile all combinationally in one cycle --
+// confirmed by report_timing to be 22 logic levels deep (two
+// non-power-of-2 divisions, index/11 and feature/9, feeding a full
+// gather-mux across pool1_result's 1352 elements), closing setup with
+// -0.257ns slack on the k_tile_reg -> a_tile_reg path. pb_stage splits
+// this into two sub-cycles: stage 0 computes and registers the
+// address arithmetic only; stage 1 uses those registered values to do
+// the actual gather+write, one cycle later. Costs one extra cycle per
+// (scnt,jcnt) pair (128 pairs x 5 k_tiles = +640 cycles total
+// inference latency) in exchange for real timing closure.
+reg pb_stage;
+reg [3:0] pb_row_reg, pb_col_reg;
+reg [2:0] pb_ch_reg;
+reg [1:0] pb_kr_reg, pb_kc_reg;
+reg pb_valid_reg;
 reg fc_weights_req_valid;     // same, for fc_weights (used in LOAD_FC)
 // c2 was shrunk from 16 to 8 (see systolic_array instantiation below --
 // 256 PEs needs more DSPs than this board has, even in the best case of
@@ -270,11 +304,10 @@ systolic_array#(.r1(8), .c1(16), .r2(16), .c2(16)) conv (
 // existing cycle counts, and is the correct trade given how tight this
 // project's LUT budget already was even before this bug.
 
-relu#(.r1(8), .c1(16)) rel1 (
+relu#(.r1(8), .c1(16), .SHIFT_AMOUNT(RELU1_SHIFT)) rel1 (
     .results(conv1_result_snapshot_rescaled),
     .relu_results(relu_results1),
-    .conv_bias(current_conv_bias),
-    .shift_amount(relu1_shift)
+    .conv_bias(current_conv_bias)
 );
 
 // rel2 deliberately stays c1=16, unchanged: it still operates on the
@@ -283,11 +316,10 @@ relu#(.r1(8), .c1(16)) rel1 (
 // systolic passes (c_half2 0 and 1) to cover its 16 real channels, but
 // they both write into the same full-width conv2_accumulator before
 // relu2 ever sees it -- see WAIT_COMPUTE2 below.
-relu#(.r1(8), .c1(16)) rel2 (
+relu#(.r1(8), .c1(16), .SHIFT_AMOUNT(RELU2_SHIFT)) rel2 (
     .results(conv2_accumulator_rescaled),
     .relu_results(relu_results2),
-    .conv_bias(current_conv_bias),
-    .shift_amount(relu2_shift)
+    .conv_bias(current_conv_bias)
 );
 
 // row_buf1 is 4 slots deep (see declaration above). completed_row1 is
@@ -349,6 +381,8 @@ always@(posedge clk) begin
         kernel_matrix2_addr <= 0;
         fc_weights_req_valid <= 0;
         fc_weights_addr <= 0;
+        pb_stage <= 0;
+        pb_valid_reg <= 0;
     end
     else begin
         case(state)
@@ -603,33 +637,73 @@ always@(posedge clk) begin
                     // 0..7), one pool1_result element per (scnt,jcnt)
                     // sub-cycle -- same structure as before, just scnt
                     // now only runs 0..7 instead of 0..15.
-                    index   = tile_count*8 + scnt;   // spatial position, 0..120 valid (121..127 is last-tile padding)
-                    row     = index / 11;
-                    col     = index % 11;
-                    feature = k_tile*16 + jcnt; // reduction-dim position, 0..79 (72..79 is zero padding)
-                    if(index<121 && feature<72) begin
-                        ch = feature / 9;
-                        kr = (feature % 9) / 3;
-                        kc = feature % 3;
-                        a_tile[scnt][jcnt] <= pool1_result[ch][row+kr][col+kc];
+                    //
+                    // CHANGED: split into two sub-cycles (pb_stage)
+                    // instead of computing the index arithmetic AND the
+                    // pool1_result gather AND the a_tile write all
+                    // combinationally in one cycle. That single-cycle
+                    // version put two non-power-of-2 divisions
+                    // (index/11, feature/9) plus a full gather-mux
+                    // across pool1_result's 1352 elements all on one
+                    // combinational path -- confirmed by report_timing
+                    // to be 22 logic levels deep, closing setup with
+                    // -0.257ns slack (source k_tile_reg, destination
+                    // a_tile_reg). Splitting the address arithmetic
+                    // (stage 0) from the actual gather+write (stage 1)
+                    // roughly halves the logic on either side of the
+                    // new register boundary. Costs one extra cycle per
+                    // (scnt,jcnt) pair -- 128 pairs x 5 k_tiles = +640
+                    // cycles total inference latency, in exchange for
+                    // real timing closure.
+                    if (!pb_stage) begin
+                        // Stage 0: address arithmetic only -- register
+                        // the results, don't touch a_tile or advance
+                        // scnt/jcnt yet.
+                        index   = tile_count*8 + scnt;   // spatial position, 0..120 valid (121..127 is last-tile padding)
+                        row     = index / 11;
+                        col     = index % 11;
+                        feature = k_tile*16 + jcnt; // reduction-dim position, 0..79 (72..79 is zero padding)
+                        pb_valid_reg <= (index<121 && feature<72);
+                        if (index<121 && feature<72) begin
+                            pb_ch_reg <= feature / 9;
+                            pb_kr_reg <= (feature % 9) / 3;
+                            pb_kc_reg <= feature % 3;
+                        end
+                        pb_row_reg <= row;
+                        pb_col_reg <= col;
+                        pb_stage   <= 1;
                     end
                     else begin
-                        a_tile[scnt][jcnt] <= 0;
-                    end
+                        // Stage 1: use the REGISTERED indices from stage
+                        // 0 (one cycle old, still corresponding to the
+                        // same (scnt,jcnt) -- neither counter has
+                        // advanced yet) to gather from pool1_result and
+                        // write a_tile. Only NOW do scnt/jcnt (and
+                        // tile2_km_loaded/state on the last iteration)
+                        // advance -- same advance timing as the
+                        // original single-cycle version, just landing
+                        // one cycle later overall.
+                        if (pb_valid_reg)
+                            a_tile[scnt][jcnt] <= pool1_result[pb_ch_reg][pb_row_reg+pb_kr_reg][pb_col_reg+pb_kc_reg];
+                        else
+                            a_tile[scnt][jcnt] <= 0;
 
-                    if (jcnt == 15) begin
-                        jcnt <= 0;
-                        if (scnt == 7) begin
-                            scnt <= 0;
-                            tile2_km_loaded <= 0;   // reset for the NEXT k_tile's phase A
-                            state <= START_COMPUTE2;
+                        pb_stage <= 0;
+
+                        if (jcnt == 15) begin
+                            jcnt <= 0;
+                            if (scnt == 7) begin
+                                scnt <= 0;
+                                tile2_km_loaded <= 0;   // reset for the NEXT k_tile's phase A
+                                state <= START_COMPUTE2;
+                            end
+                            else begin
+                                scnt <= scnt + 1;
+                            end
                         end
                         else begin
-                            scnt <= scnt + 1;
+                            jcnt <= jcnt + 1;
                         end
-                    end
-                    else begin
-                        jcnt <= jcnt + 1;
                     end
                 end
             end
