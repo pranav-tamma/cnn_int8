@@ -58,12 +58,13 @@ module top_cnn_tb;
     reg signed [31:0] conv2_bias [0:15];
     reg signed [31:0] fc_bias [0:9];
 
-    // --- requantization shifts: from generated/scales.txt's printout,
-    // NOT hardcoded here permanently -- update these two lines to match
-    // whatever quantize_int8.py prints after you calibrate with real,
-    // varied digit images (values below are placeholders).
-    reg [4:0] relu1_shift = 8;
-    reg [4:0] relu2_shift = 10;
+    // relu1_shift/relu2_shift REMOVED as testbench registers -- top_cnn.sv
+    // no longer has runtime ports for these. They're now compile-time
+    // localparams (RELU1_SHIFT/RELU2_SHIFT) directly inside top_cnn.sv,
+    // right before the FSM state localparams -- edit THOSE when
+    // recalibrating, then resynthesize. This was a deliberate LUT-savings
+    // fix: a runtime-variable shift forced 256 real barrel shifters
+    // (across both relu instances) instead of free fixed-wire shifts.
 
     // --- per-channel rescale multipliers (x256 fixed-point) -- NEW for
     // per-channel weight quantization. Loaded via `include, same pattern
@@ -73,10 +74,11 @@ module top_cnn_tb;
     reg signed [15:0] conv1_rescale [0:15];
     reg signed [15:0] conv2_rescale [0:15];
     reg signed [15:0] fc_rescale [0:9];
-    // fc_shift: the FC layer's final output shift, now calibrated (see
-    // top_cnn.sv's fc_shift port comment) instead of a hardcoded >>>8.
-    // Update this to match whatever quantize_int8.py prints, same
-    // manual-update convention as relu1_shift/relu2_shift above.
+    // NEW: FC's final output shift, now calibrated (see top_cnn.sv's
+    // fc_shift port comment) instead of a hardcoded >>>8. Update this to
+    // match whatever quantize_int8.py prints (placeholder value below).
+    // Still a runtime port -- unaffected by the relu1_shift/relu2_shift
+    // change above, since fc_shift never went through relu.sv.
     reg [4:0] fc_shift = 6;
 
     wire signed [31:0] final_scores [0:9];
@@ -158,8 +160,6 @@ module top_cnn_tb;
         .kernel_matrix2_rdata(kernel_matrix2_rdata),
         .conv1_bias(conv1_bias),
         .conv2_bias(conv2_bias),
-        .relu1_shift(relu1_shift),
-        .relu2_shift(relu2_shift),
         .conv1_rescale(conv1_rescale),
         .conv2_rescale(conv2_rescale),
         .fc_rescale(fc_rescale),
